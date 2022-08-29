@@ -104,13 +104,7 @@ class NetFusion_custom(nn.Module):
 
         flow_new = self.fusion(concat_feat)
 
-        return flow_new
-
-
-    def fuse_flows(self, image1, image2, curr_flow, prev_flow12, prev_flow21):
-        flow = self(image1, image2, curr_flow, prev_flow12, prev_flow21)
-        flow = flow[0] * self.div_flow
-        return flow # smoothed curr_flow with regard to previous flows
+        return flow_new * self.div_flow
 
 
 def netfusion(pretrained: bool = True, div_flow: float = 20.0, batchNorm: bool = False):

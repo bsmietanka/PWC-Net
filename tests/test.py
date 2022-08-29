@@ -11,4 +11,4 @@ def test_flow_fusion():
     flow2 = torch.rand(1, 2, 224, 224)
     flow3 = torch.rand(1, 2, 224, 224)
 
-    adapted_flow = model.fuse_flows(im1, im2, flow1, flow2, flow3)
+    adapted_flow = model(im1, im2, flow1, flow2, flow3)
