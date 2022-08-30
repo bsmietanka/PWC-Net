@@ -5,18 +5,19 @@ Copyright (C) 2018 NVIDIA Corporation.  All rights reserved.
 Licensed under the CC BY-NC-SA 4.0 license (https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode).
 """
 
+from math import ceil
 from pkg_resources import resource_filename
 
 import torch
 import torch.nn as nn
+from torch.nn import functional
+
 from .NetFusion import NetFusion
 
 
-CHECKPOINT_PATH = resource_filename('flow_fusion', 'checkpoints/fusion_net.pth.tar')
+CHECKPOINT_PATH = resource_filename("flow_fusion", "checkpoints/fusion_net.pth.tar")
 
-__all__ = [
- 'netfusion'
-]
+__all__ = ["netfusion"]
 
 
 def channelnorm(input: torch.Tensor) -> torch.Tensor:
@@ -24,11 +25,13 @@ def channelnorm(input: torch.Tensor) -> torch.Tensor:
 
 
 class NetFusion_custom(nn.Module):
-    def __init__(self, div_flow = 20.0, batchNorm=False):
-        super(NetFusion_custom,self).__init__()
+    def __init__(self, div_flow=20.0, batchNorm=False):
+        super(NetFusion_custom, self).__init__()
 
         self.batchNorm = batchNorm
         self.div_flow = div_flow
+
+        self._divisor = 64
 
         self.fusion = NetFusion(batchNorm=self.batchNorm, inPlanes=9)
 
@@ -41,37 +44,40 @@ class NetFusion_custom(nn.Module):
         """
         B, C, H, W = x.size()
 
-        xx = torch.arange(0, W).view(1,-1).repeat(H,1)
-        yy = torch.arange(0, H).view(-1,1).repeat(1,W)
-        xx = xx.view(1,1,H,W).repeat(B,1,1,1)
-        yy = yy.view(1,1,H,W).repeat(B,1,1,1)
-        grid = torch.cat((xx,yy),1).float()
+        xx = torch.arange(0, W).view(1, -1).repeat(H, 1)
+        yy = torch.arange(0, H).view(-1, 1).repeat(1, W)
+        xx = xx.view(1, 1, H, W).repeat(B, 1, 1, 1)
+        yy = yy.view(1, 1, H, W).repeat(B, 1, 1, 1)
+        grid = torch.cat((xx, yy), 1).float()
 
         if x.is_cuda:
             grid = grid.cuda()
         vgrid = grid + flo
 
-        vgrid[:,0,:,:] = 2.0 * vgrid[:,0,:,:] / max(W - 1, 1) - 1.0
-        vgrid[:,1,:,:] = 2.0 * vgrid[:,1,:,:] / max(H - 1, 1) - 1.0
+        vgrid[:, 0, :, :] = 2.0 * vgrid[:, 0, :, :] / max(W - 1, 1) - 1.0
+        vgrid[:, 1, :, :] = 2.0 * vgrid[:, 1, :, :] / max(H - 1, 1) - 1.0
 
-        vgrid = vgrid.permute(0,2,3,1)
+        vgrid = vgrid.permute(0, 2, 3, 1)
         output = nn.functional.grid_sample(x, vgrid, align_corners=True)
         mask = torch.ones(x.size())
         if x.is_cuda:
             mask = mask.cuda()
         mask = nn.functional.grid_sample(mask, vgrid, align_corners=True)
 
-        mask[mask<0.999] = 0
-        mask[mask>0] = 1
+        mask[mask < 0.999] = 0
+        mask[mask > 0] = 1
 
-        return output*mask
+        return output * mask
 
     def forward(self, im1, im2, cur_flow, prev_flow, prev_flow_back):
         b, _, h, w = im1.shape
-        prev_flow = self.warp_back(prev_flow, prev_flow_back) #warp 0->1 to frame 1
+
+        prev_flow = self.warp_back(prev_flow, prev_flow_back)  # warp 0->1 to frame 1
 
         im2_warp_backward_cur_flow = self.warp_back(im2, cur_flow)  # im2 1->2 im1
-        im2_warp_backward_prev_flow = self.warp_back(im2, prev_flow) # im2 wapred 1->2 im1
+        im2_warp_backward_prev_flow = self.warp_back(
+            im2, prev_flow
+        )  # im2 wapred 1->2 im1
 
         mask_warp_cur_flow = torch.ones(b, 1, h, w).float()
         if im1.is_cuda:
@@ -85,25 +91,36 @@ class NetFusion_custom(nn.Module):
 
         cur_flow = cur_flow / self.div_flow
         prev_flow = prev_flow / self.div_flow
-        
+
         # norm_cur_flow = channelnorm(cur_flow)
         # norm_prev_flow = channelnorm(prev_flow)
 
-        diff_im1_cur_flow = channelnorm(im1-im2_warp_backward_cur_flow)
-        diff_im1_prev_flow = channelnorm(im1-im2_warp_backward_prev_flow)
+        diff_im1_cur_flow = channelnorm(im1 - im2_warp_backward_cur_flow)
+        diff_im1_prev_flow = channelnorm(im1 - im2_warp_backward_prev_flow)
 
         diff_im1_cur_flow_comp = 0.5 - diff_im1_cur_flow
-        diff_im1_cur_flow_comp[mask_warp_cur_flow>0] = 0
+        diff_im1_cur_flow_comp[mask_warp_cur_flow > 0] = 0
         diff_im1_prev_flow_comp = 0.5 - diff_im1_prev_flow
-        diff_im1_prev_flow_comp[mask_warp_prev_flow>0] = 0
+        diff_im1_prev_flow_comp[mask_warp_prev_flow > 0] = 0
 
         diff_im1_cur_flow = diff_im1_cur_flow + diff_im1_cur_flow_comp
         diff_im1_prev_flow = diff_im1_prev_flow + diff_im1_prev_flow_comp
 
-        concat_feat = torch.cat((im1, cur_flow, prev_flow, diff_im1_cur_flow, diff_im1_prev_flow), dim=1)
+        h_ = int(ceil(h / self._divisor)) * self._divisor
+        w_ = int(ceil(w / self._divisor)) * self._divisor
+        pad_h = h_ - h
+        pad_w = w_ - w
+        concat_feat = torch.cat(
+            (im1, cur_flow, prev_flow, diff_im1_cur_flow, diff_im1_prev_flow), dim=1
+        )
+        concat_feat = functional.pad(concat_feat, (0, pad_w, 0, pad_h), mode="constant")
 
         flow_new = self.fusion(concat_feat)
 
+        if pad_h > 0:
+            flow_new = flow_new[..., :-pad_h, :]
+        if pad_w > 0:
+            flow_new = flow_new[..., :-pad_w]
         return flow_new * self.div_flow
 
 
@@ -111,8 +128,8 @@ def netfusion(pretrained: bool = True, div_flow: float = 20.0, batchNorm: bool =
     model = NetFusion_custom(div_flow=div_flow, batchNorm=batchNorm)
     if pretrained:
         data = torch.load(CHECKPOINT_PATH)
-        if 'state_dict' in data.keys():
-            model.load_state_dict(data['state_dict'])
+        if "state_dict" in data.keys():
+            model.load_state_dict(data["state_dict"])
         else:
             model.load_state_dict(data)
 
